@@ -151,7 +151,7 @@ ds.manager =
         }).error(function(xhr, status, error) {
           self.error('Error loading dashboard. ' + error)
         }).done(function(data) {
-          var dashboard = ds.models.dashboard(data.dashboards[0])
+          var dashboard = ds.models.dashboard(data)
           holder.dashboard = dashboard
 
           if (data.preferences.renderer && ds.charts[data.preferences.renderer]) {
@@ -297,7 +297,7 @@ ds.manager =
     }
 
     self.refresh = function() {
-      if (self.current) {
+      if (self.current && (ds.app.current_mode != ds.app.Mode.EDIT)) {
         self.load(self.current.url, self.current.element)
       }
     }
@@ -306,7 +306,7 @@ ds.manager =
     // here
     self.toggle_interactive_charts = function() {
         $.get('/api/preferences', function(data) {
-            var setting = !data.preferences.interactive
+            var setting = !data.interactive
             var dashboard_url = URI(self.current.url)
             var window_url = URI(window.location)
 
@@ -330,8 +330,15 @@ ds.manager =
        ----------------------------------------------------------------------------- */
 
     self.set_time_range = function(from, until) {
-        var location = URI(window.location).setQuery('from', from).href()
-        window.history.pushState({url: self.current.url, element:self.current.element}, '', location)
+        var uri = URI(window.location)
+        from
+            ? uri.setQuery('from', from)
+            : uri.removeQuery('from')
+        until
+            ? uri.setQuery('until', until)
+            : uri.removeQuery('until')
+
+        window.history.pushState({url: self.current.url, element:self.current.element}, '', uri.href())
 
         self.current.setRange(from, until)
         bean.fire(self, ds.app.Event.RANGE_CHANGED, {
@@ -475,12 +482,12 @@ ds.manager =
     self.duplicate = function(href, handler) {
         // Get dashboard
         $.get(href, function(data) {
-            var dashboard = data.dashboards[0]
+            var dashboard = data
             dashboard.title = 'Copy of ' + dashboard.title
 
             // Get definition
             $.get(href + '/definition', function(data) {
-                dashboard.definition = data.definition
+                dashboard.definition = data
                 // Duplicate dashboard
                 $.ajax({
                     type: 'POST',

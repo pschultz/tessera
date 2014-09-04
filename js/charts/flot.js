@@ -16,29 +16,44 @@ ds.charts.flot =
       var default_options = {
         colors: ds.charts.util.get_palette(),
         series: {
-          lines: { show: true, lineWidth: 1, fill: false},
+          lines: {
+            show: true,
+            lineWidth: 1,
+            steps: false,
+            fill: false
+          },
           stack: null,
           points: { show: false },
           bars: { show: false }
         },
         xaxis: {
           mode: "time",
-          twelveHourClock: true,
-          // timeformat: '',
-          tickColor: theme_colors.minorGridLineColor
-          // axisLabel: 'Time'
+          tickFormatter: function(value) {
+            return moment(value).tz(ds.config.DISPLAY_TIMEZONE).format('h:mm A')
+          },
+          tickColor: theme_colors.minorGridLineColor,
+          font: {
+            color: theme_colors.fgcolor,
+            size: 12
+          }
         },
         yaxes: [
           {
-            tickFormatter: d3.format(',3s'), /* TODO: get from item options */
+            tickFormatter: d3.format(',.3s'),
             reserveSpace: 30,
             labelWidth: 30,
-            tickColor: theme_colors.minorGridLineColor
-            // axisLabel: 'Things'
+            tickColor: theme_colors.minorGridLineColor,
+            font: {
+              color: theme_colors.fgcolor,
+              size: 12
+            }
           },
           {
-            // tickFormatter: opendash.format_kmbt,
-            color: '#ccc'
+            tickFormatter: d3.format(',.3s'),
+            font: {
+              color: theme_colors.fgcolor,
+              size: 12
+            }
           }
         ],
         points: {
@@ -50,18 +65,19 @@ ds.charts.flot =
         legend: {
           container: null,
           noColumns: 2,
-          position: 'nw',
+          position: 'sw',
           backgroundColor: 'transparent',
           labelBoxBorderColor: 'transparent'
         },
         grid: {
-          borderWidth: 0,
+          borderWidth: 1,
           hoverable: true,
           clickable: true,
           autoHighlight: false,
           /* grid.color actually sets the color of the legend
            * text. WTH? */
-          color: theme_colors.fgcolor
+          color: theme_colors.fgcolor,
+          borderColor: theme_colors.minorGridLineColor
         },
         selection: {
           mode: "x",
@@ -72,7 +88,7 @@ ds.charts.flot =
         },
         crosshair: {
           mode: "x",
-          color: "red",
+          color: "#BBB",
           lineWidth: 1
         }
       }
@@ -95,31 +111,16 @@ ds.charts.flot =
         var series = context.plot.getData()
         var item = items[0]
         var point = series[item.serieIndex].data[item.dataIndex]
-        /* TODO: should do all this with handlebars templates; this is
-         * left over from looong ago */
-        var contents
-              = '<table class="table table-condensed"><tbody>'
-              + '<tr><span class="ds-tooltip-time">'
-              + moment(point[0]).format('dd, h:mm:ss A UTC')
-              + '</span></tr>'
-        $.each(items, function(index, item) {
-          var ser = series[item.serieIndex]
-          var pair = ser.data[item.dataIndex]
-          /* TODO: get a formatter from the item's options */
-          var format = d3.format(',.3s')
-          contents += ( "<tr>"
-                        // Badge + name
-                      + "<td class='ds-tooltip-label'><span class='badge' style='background-color: "
-                      + ser.color + "'><i></i></span> "
-                      + ser.label + "</td>"
-                        // Value
-                      + "<td class='ds-tooltip-value'>"
-                      + format(pair[1])
-                      + "</td>"
-                      + "</tr>"
-                      )
+
+        var contents = ds.templates.flot.tooltip({
+          time: point[0],
+          items: items.map(function(item) {
+                   return {
+                     series: series[item.serieIndex],
+                     value: series[item.serieIndex].data[item.dataIndex][1]
+                   }
+                 })
         })
-        contents += "</tbody></table>"
 
         $("#ds-tooltip").remove()
         show_tooltip(pos.pageX, pos.pageY, contents)
@@ -128,8 +129,28 @@ ds.charts.flot =
       $(container).bind("unmultihighlighted", function(event) {
         $("#ds-tooltip").remove()
       })
-
     }
+
+    function render_legend(item, query, palette, flot_options) {
+      var legend_id = '#ds-legend-' + item.item_id
+      var legend = ''
+      var data = query.chart_data('flot')
+      for (var i in data) {
+        var series = data[i]
+        var label = series.label
+        var color = palette[i % palette.length]
+
+        var cell = '<div class="ds-legend-cell">'
+                 + '<span class="color" style="background-color:' + color + '"></span>'
+                 + '<span class="label" style="color:' + flot_options.xaxis.font.color +  '">' + label + '</span>'
+                 + '</div>'
+        legend += cell
+      }
+      var elt = $(legend_id)
+      elt.html(legend)
+      elt.equalize({equalize: 'outerWidth', reset: true })
+    }
+
 
     self.simple_line_chart = function(e, item, query) {
       var options = item.options || {}
@@ -156,19 +177,23 @@ ds.charts.flot =
           plot: null
       }
       setup_plugins(e, context)
-      context.plot = $.plot($(e), query.chart_data('flot'),
-                            ds.extend(get_default_options(), {
-                              colors: ds.charts.util.get_palette(options.palette),
-                              grid: {
-                                borderWidth: 0,
-                                hoverable: true,
-                                clickable: true,
-                                autoHighlight: false
-                              },
-                              multihighlight: {
-                                mode: "x"
-                              }
-                            }))
+      var defaults  = get_default_options()
+      var palette   = ds.charts.util.get_palette(options.palette)
+      var flot_options = ds.extend(get_default_options(), {
+        colors: palette,
+        grid: ds.extend(defaults.grid, {
+          hoverable: true,
+          clickable: true,
+          autoHighlight: false
+        }),
+        legend: {
+          show: false
+        }
+      })
+
+      context.plot = $.plot($(e), query.chart_data('flot'), flot_options)
+      render_legend(item, query, palette, flot_options)
+
       return self
     }
 
@@ -202,17 +227,28 @@ ds.charts.flot =
       var context = {
           plot: null
       }
+      var legend_id = '#ds-legend-' + item.item_id
+      var palette = ds.charts.util.get_palette(options.palette)
+      var flot_options = ds.extend(get_default_options(), {
+        colors: palette,
+        legend: {
+          container: legend_id,
+          labelBoxBorderColor: 'transparent',
+          show: true,
+          noColumns: 4
+        },
+        series: {
+          lines: { show: true, lineWidth: 1, fill: 1},
+          stack: true,
+          points: { show: false },
+          bars: { show: false }
+        }
+      })
+
       setup_plugins(e, context)
-      context.plot = $.plot($(e), query.chart_data('flot'),
-                            ds.extend(get_default_options(), {
-                              colors: ds.charts.util.get_palette(options.palette),
-                              series: {
-                                lines: { show: true, lineWidth: 1, fill: 1},
-                                stack: true,
-                                points: { show: false },
-                                bars: { show: false }
-                              }
-                            }))
+      context.plot = $.plot($(e), query.chart_data('flot'), flot_options)
+
+      render_legend(item, query, palette, flot_options)
       return self
     }
 

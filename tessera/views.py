@@ -9,8 +9,8 @@ import inflection
 from flask import render_template, request, session
 from werkzeug.exceptions import HTTPException
 
-from .model import *
-from .model import database
+from tessera_client.api.model import *
+from . import database
 from .application import app
 from .application import db
 from ._version import __version__
@@ -33,7 +33,6 @@ def _jsonify(data, status=200, headers=None):
 
 def _set_exception_response(http_exception):
     http_exception.response = _jsonify({
-        'ok' : False,
         'error_message' : http_exception.description
     }, status=http_exception.code)
     return http_exception
@@ -48,10 +47,16 @@ session.
         session[name] = value
     return value
 
+def _get_param_boolean(name, default=None):
+    value = _get_param(name, default)
+    return value == 'True' \
+        or value == 'true'
+
 def _get_config():
     """Retrieve a dictionary containing all UI-relevant config settings."""
     return {
         'GRAPHITE_URL' : app.config['GRAPHITE_URL'],
+        'DISPLAY_TIMEZONE' : app.config.get('DISPLAY_TIMEZONE', 'UTC'),
         'DEFAULT_FROM_TIME' : app.config['DEFAULT_FROM_TIME']
     }
 
@@ -63,7 +68,10 @@ defaults.
     return {
         'interactive' : _get_param('interactive', app.config['INTERACTIVE_CHARTS_DEFAULT'], store_in_session=store_in_session) == 'true',
         'theme' : _get_param('theme', app.config['DEFAULT_THEME'], store_in_session=store_in_session),
-        'renderer' : _get_param('renderer', app.config['INTERACTIVE_CHARTS_RENDERER'], store_in_session=store_in_session)
+        'renderer' : _get_param('renderer', app.config['INTERACTIVE_CHARTS_RENDERER'], store_in_session=store_in_session),
+        'refresh' : _get_param('refresh', app.config['DEFAULT_REFRESH_INTERVAL'], store_in_session=store_in_session),
+        'timezone' : _get_param('timezone', app.config['DISPLAY_TIMEZONE'], store_in_session=store_in_session),
+        'graphite_url' : _get_param('graphite_url', app.config['GRAPHITE_URL'], store_in_session=store_in_session)
     }
 
 def _set_preferences(prefs):
@@ -76,15 +84,15 @@ def _dashboard_sort_column():
 the 'sort' and 'order' request parameters.
     """
     columns = {
-        'created' : database.Dashboard.creation_date,
-        'modified' : database.Dashboard.last_modified_date,
-        'category' : database.Dashboard.category,
-        'id' : database.Dashboard.id,
-        'title' : database.Dashboard.title
+        'created' : database.DashboardRecord.creation_date,
+        'modified' : database.DashboardRecord.last_modified_date,
+        'category' : database.DashboardRecord.category,
+        'id' : database.DashboardRecord.id,
+        'title' : database.DashboardRecord.title
     }
     colname = _get_param('sort', 'created')
     order   = _get_param('order')
-    column  = database.Dashboard.creation_date
+    column  = database.DashboardRecord.creation_date
     if colname in columns:
         column = columns[colname]
 
@@ -114,10 +122,9 @@ will be converted to their JSON representation.
     """
     if not isinstance(dashboards, list):
         dashboards = [dashboards]
-    return _jsonify({
-        'ok' : True,
-        'dashboards' : [ _set_dashboard_hrefs(d.to_json()) for d in dashboards]
-    })
+
+    include_definition = _get_param_boolean('definition', False)
+    return _jsonify([ _set_dashboard_hrefs(d.to_json(include_definition=include_definition)) for d in dashboards])
 
 def _set_tag_hrefs(tag):
     """Add ReSTful href attributes to a tag's dictionary
@@ -134,10 +141,7 @@ will be converted to their JSON representation.
 """
     if not isinstance(tags, list):
         tags = [tags]
-    return _jsonify({
-        'ok' : True,
-        'tags' : [_set_tag_hrefs(t.to_json()) for t in tags]
-    })
+    return _jsonify([_set_tag_hrefs(t.to_json()) for t in tags])
 
 # =============================================================================
 # API Endpoints
@@ -153,7 +157,13 @@ def api_dashboard_list():
     definitions.
 
     """
-    dashboards = [d for d in database.Dashboard.query.order_by(_dashboard_sort_column()).all()]
+    imported_from = request.args.get('imported_from')
+    if imported_from:
+        query = database.DashboardRecord.query.filter_by(imported_from=imported_from) \
+                                              .order_by(_dashboard_sort_column())
+    else:
+        query = database.DashboardRecord.query.order_by(_dashboard_sort_column())
+    dashboards = [d for d in query.all()]
     return _dashboards_response(dashboards)
 
 @app.route('/api/dashboard/tagged/<tag>')
@@ -162,7 +172,7 @@ def api_dashboard_list_tagged(tag):
     the metadata, not the definitions.
 
     """
-    tag = database.Tag.query.filter_by(name=tag).first()
+    tag = database.TagRecord.query.filter_by(name=tag).first()
     if not tag:
         return _dashboards_response([])
     dashboards = [d for d in tag.dashboards.order_by(_dashboard_sort_column()) if tag]
@@ -174,7 +184,7 @@ def api_dashboard_list_dashboards_in_category(category):
     just the metadata, not the definitions.
 
     """
-    dashboards = [d for d in database.Dashboard.query
+    dashboards = [d for d in database.DashboardRecord.query
                   .filter_by(category=category)
                   .order_by(_dashboard_sort_column()) ]
     return _dashboards_response(dashboards)
@@ -182,17 +192,17 @@ def api_dashboard_list_dashboards_in_category(category):
 
 @app.route('/api/dashboard/category/')
 def api_dashboard_list_all_dashboard_categories():
-    sql = 'SELECT category, count(category) FROM dashboard GROUP BY category'
+    result = db.session.query(
+        database.DashboardRecord.category,
+        db.func.count(database.DashboardRecord.category)
+    ).group_by(database.DashboardRecord.category).all()
     categories = []
-    for row in db.engine.execute(sql):
+    for (name, count) in result:
         categories.append({
-            'name' : row[0],
-            'count' : row[1]
+            'name' : name,
+            'count' : count,
         })
-    return _jsonify({
-        'ok' : True,
-        'categories' : categories
-    })
+    return _jsonify(categories)
 
 @app.route('/api/dashboard/<id>')
 def api_dashboard_get(id):
@@ -200,40 +210,33 @@ def api_dashboard_get(id):
 
     """
     try:
-        dashboard = database.Dashboard.query.get_or_404(id)
+        dashboard = database.DashboardRecord.query.get_or_404(id)
     except HTTPException as e:
         raise _set_exception_response(e)
-    dash = _set_dashboard_hrefs(dashboard.to_json())
-    response = {
-        'ok' : True,
-        'dashboards' : [dash]
-    }
     rendering = _get_param('rendering', False)
-    if rendering or _get_param('definition', False):
-        dash['definition'] = json.loads(dashboard.definition.definition)
+    include_definition = _get_param_boolean('definition', False)
+    dash = _set_dashboard_hrefs(dashboard.to_json(rendering or include_definition))
     if rendering:
-        response['config'] = _get_config()
-        response['preferences'] = _get_preferences()
-    return _jsonify(response)
+        dash['preferences'] = _get_preferences()
+    return _jsonify(dash)
 
 @app.route('/api/dashboard/', methods=['POST'])
 def api_dashboard_create():
     """Create a new dashboard with an empty definition.
 
     """
-    dashboard = database.Dashboard.from_json(request.json)
+    dashboard = database.DashboardRecord.from_json(request.json)
     if 'definition' in request.json:
-        dashboard.definition = database.DashboardDef(dumps(request.json['definition']))
+        dashboard.definition = database.DefinitionRecord(dumps(request.json['definition']))
     else:
-        dashboard.definition = database.DashboardDef(dumps(DashboardDefinition()))
+        dashboard.definition = database.DefinitionRecord(dumps(DashboardDefinition()))
     mgr.store_dashboard(dashboard)
     href = '/api/dashboard/{0}'.format(dashboard.id)
-    return _jsonify({ 'ok' : True,
-                      'dashboard_href' : href,
-                      # TODO: should use normalized method for this
-                      'view_href' : '/dashboards/{0}/{1}'.format(dashboard.id, inflection.parameterize(dashboard.title)) },
-                    status=201,
-                    headers = { 'Location' : href })
+    return _jsonify({
+        'dashboard_href' : href,
+        # TODO: should use normalized method for this
+        'view_href' : '/dashboards/{0}/{1}'.format(dashboard.id, inflection.parameterize(dashboard.title))
+    }, status=201, headers = { 'Location' : href })
 
 @app.route('/api/dashboard/<id>', methods=['PUT'])
 def api_dashboard_update(id):
@@ -242,12 +245,13 @@ def api_dashboard_update(id):
     """
     body = json.loads(request.data)
     try:
-        dashboard = database.Dashboard.query.get_or_404(id)
+        dashboard = database.DashboardRecord.query.get_or_404(id)
     except HTTPException as e:
         raise _set_exception_response(e)
     dashboard.merge_from_json(body)
     mgr.store_dashboard(dashboard)
-    return _jsonify({ 'ok' : True })
+    # TODO - return similar to create, above
+    return _jsonify({})
 
 @app.route('/api/dashboard/<id>', methods=['DELETE'])
 def api_dashboard_delete(id):
@@ -255,12 +259,12 @@ def api_dashboard_delete(id):
 
     """
     try:
-        dashboard = database.Dashboard.query.get_or_404(id)
+        dashboard = database.DashboardRecord.query.get_or_404(id)
     except HTTPException as e:
         raise _set_exception_response(e)
     db.session.delete(dashboard)
     db.session.commit()
-    return _jsonify({ 'ok' : True },
+    return _jsonify({},
                     status=204)
 
 @app.route('/api/dashboard/<id>/definition')
@@ -269,17 +273,14 @@ def api_dashboard_get_definition(id):
     representation to use when modifiying a dashboard.
 
     """
-    dashboard = database.Dashboard.query.filter_by(id=id)[0]
+    dashboard = database.DashboardRecord.query.filter_by(id=id)[0]
     try:
-        definition = database.Dashboard.query.get_or_404(id).definition.to_json()
+        definition = database.DashboardRecord.query.get_or_404(id).definition.to_json()
     except HTTPException as e:
         raise _set_exception_response(e)
     definition['href'] = '/api/dashboard/{0}/definition'.format(id)
     definition['dashboard_href'] = '/api/dashboard/{0}'.format(id)
-    return _jsonify({
-        'ok' : True,
-        'definition' : definition
-    })
+    return _jsonify(definition)
 
 @app.route('/api/dashboard/<id>/definition', methods=['PUT'])
 def api_dashboard_update_definition(id):
@@ -290,7 +291,7 @@ def api_dashboard_update_definition(id):
 
     """
     try:
-        dashboard = database.Dashboard.query.get_or_404(id)
+        dashboard = database.DashboardRecord.query.get_or_404(id)
     except HTTPException as e:
         raise _set_exception_response(e)
 
@@ -300,11 +301,11 @@ def api_dashboard_update_definition(id):
     if dashboard.definition:
         dashboard.definition.definition = dumps(definition)
     else:
-        dashboard.definition = database.DashboardDef(request.data)
+        dashboard.definition = database.DashboardRecordDef(request.data)
 
     mgr.store_dashboard(dashboard)
 
-    return _jsonify({ 'ok' : True })
+    return _jsonify({})
 
 #
 # Tags
@@ -315,25 +316,13 @@ def api_tag_list():
     """Listing for all tags.
 
     """
-    sql = 'SELECT tag.id, tag.name, tag.description, tag.fgcolor, tag.bgcolor, count(*)' \
-    + ' FROM tag' \
-    + ' INNER JOIN dashboard_tags' \
-    + ' ON dashboard_tags.tag_id = tag.id' \
-    + ' GROUP BY tag.id' \
-    + ' ORDER BY tag.name'
-
-    tags = []
-    for row in db.engine.execute(sql):
-        tag = database.Tag(name=row[1], description=row[2], fgcolor=row[3], bgcolor=row[4], count=row[5])
-        tag.id = row[0]
-        tags.append(tag)
-
+    tags = db.session.query(database.TagRecord).all()
     return _tags_response(tags)
 
 @app.route('/api/tag/<id>')
 def api_tag_get(id):
     try:
-        tag = database.Tag.query.get_or_404(id)
+        tag = database.TagRecord.query.get_or_404(id)
         return _tags_response(tag)
     except HTTPException as e:
         raise _set_exception_response(e)
@@ -345,23 +334,16 @@ def api_tag_get(id):
 
 @app.route('/api/config')
 def api_config_get():
-    return _jsonify({
-        'ok' : True,
-        'config' : _get_config()
-    })
+    return _jsonify(_get_config())
 
 @app.route('/api/preferences/')
 def api_preferences_get():
-    return _jsonify({
-        'ok' : True,
-        'preferences' : _get_preferences()
-    })
+    return _jsonify(_get_preferences())
 
 @app.route('/api/preferences/', methods=['PUT'])
 def api_preferences_put():
     _set_preferences(request.json)
-    return _jsonify({ 'ok' : True })
-
+    return _jsonify(_get_preferences())
 
 # =============================================================================
 # UI
@@ -379,6 +361,13 @@ class RenderContext:
 
     def get(self, key, default=None, store_in_session=False):
         return _get_param(key, default=default, store_in_session=store_in_session)
+
+    def get_int(self, key, default=None, store_in_session=False):
+        return int(self.get(key, default=default, store_in_session=store_in_session))
+
+    def get_str(self, key, default=None, store_in_session=False):
+        return str(self.get(key, default=default, store_in_session=store_in_session))
+
 
 def _render_template(template, **kwargs):
     return render_template(template, ctx=RenderContext(), **kwargs)
@@ -458,7 +447,7 @@ def ui_dashboard(id, slug=None, path=None):
             'name' : name
         }
     try:
-        dashboard = database.Dashboard.query.get_or_404(id)
+        dashboard = database.DashboardRecord.query.get_or_404(id)
         return _render_client_side_dashboard(dashboard, transform=transform)
     except HTTPException as e:
         raise _set_exception_response(e)

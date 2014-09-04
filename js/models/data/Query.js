@@ -35,7 +35,12 @@ ds.models.data.Query = function(data) {
 
   self.render_templates = function(context) {
     self.expanded_targets = self.targets.map(function(t) {
+                              try {
                                 return ds.render_template(t, context)
+                              } catch ( e ) {
+                                ds.manager.error('Failed to expand query ' + self.name + ': ' + e)
+                                return t
+                              }
                             })
   }
 
@@ -45,6 +50,7 @@ ds.models.data.Query = function(data) {
               .path('/render')
               .setQuery('format', options.format || 'png')
               .setQuery('from', options.from || ds.config.DEFAULT_FROM_TIME || self.DEFAULT_FROM_TIME)
+              .setQuery('tz', ds.config.DISPLAY_TIMEZONE)
     if (options.until) {
       url.setQuery('until', options.until)
     }

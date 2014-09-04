@@ -1,5 +1,9 @@
 ds.register_dashboard_item('summation_table', {
 
+  display_name: 'Summation Table',
+  icon: 'fa fa-table',
+  category: 'data-table',
+
   constructor: function(data) {
     'use strict'
 
@@ -25,7 +29,7 @@ ds.register_dashboard_item('summation_table', {
       if (self.striped)
         data.striped = self.striped
       if (self.title)
-      data.title = self.title
+        data.title = self.title
       return data
     }
 
